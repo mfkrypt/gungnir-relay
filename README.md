@@ -1,5 +1,3 @@
-# Gungnir + Discord Webhook
-
 ## Overview
 
 Gungnir streams Certificate Transparency logs in real-time. We pipe its JSONL
