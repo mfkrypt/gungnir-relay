@@ -26,7 +26,7 @@ Credits to @g0ldencybersec
 ```
 ~/.config/gungnir/
 ├── domains.txt          # root domain filter list
-├── discord-relay.py     # the relay script
+├── relay_script.py      # the relay script
 ```
 
 ```
