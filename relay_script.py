@@ -11,6 +11,10 @@ Config via environment variables:
   RATE_LIMIT_SECONDS    - Minimum seconds between Discord POSTs (default: 2)
   BATCH_SIZE            - Max domains per embed when queueing (default: 5)
   LOG_FILE              - Log file path (default: stderr only)
+  DEDUP_STATE_FILE      - File persisting dedup state across restarts
+                          (default: ~/.config/gungnir/dedup_state.json)
+  LIVENESS_CHECK        - Pre-post check: dns (default) | http | none
+  LIVENESS_TIMEOUT      - Seconds before a liveness probe gives up (default: 3)
 """
 
 import json
@@ -18,6 +22,8 @@ import os
 import sys
 import time
 import logging
+import socket
+import concurrent.futures as futures
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -33,6 +39,15 @@ DEDUP_TTL = int(os.environ.get("DEDUP_TTL_SECONDS", "86400"))
 RATE_LIMIT = float(os.environ.get("RATE_LIMIT_SECONDS", "2"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))
 LOG_FILE = os.environ.get("LOG_FILE", "")
+DEDUP_STATE_FILE = os.environ.get(
+    "DEDUP_STATE_FILE",
+    os.path.expanduser("~/.config/gungnir/dedup_state.json"),
+)
+LIVENESS_CHECK = os.environ.get("LIVENESS_CHECK", "dns").lower()
+LIVENESS_TIMEOUT = float(os.environ.get("LIVENESS_TIMEOUT", "3"))
+
+
+
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -51,14 +66,49 @@ if LOG_FILE:
     file_handler.setFormatter(fmt)
     logger.addHandler(file_handler)
 
+
+
+
 # ── Dedup cache ──────────────────────────────────────────────────────────────
 
-_seen: dict[str, float] = {}  # domain → expiry timestamp
+_seen: dict[str, float] = {}  # domain → wall-clock expiry timestamp
+_state_dirty = False
+
+
+def _load_state():
+    """Load dedup state from disk so restarts don't re-alert everything."""
+    global _seen
+    try:
+        with open(DEDUP_STATE_FILE) as f:
+            data = json.load(f)
+        _seen = {d: float(exp) for d, exp in data.items()}
+        _purge_expired()
+        logger.info("Loaded %d domain(s) from dedup state", len(_seen))
+    except FileNotFoundError:
+        _seen = {}
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        logger.warning("Could not load dedup state (%s) — starting fresh", e)
+        _seen = {}
+
+
+def _save_state():
+    """Persist dedup state to disk (atomic replace, called on each new add)."""
+    global _state_dirty
+    if not _state_dirty:
+        return
+    try:
+        tmp = DEDUP_STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_seen, f)
+        os.replace(tmp, DEDUP_STATE_FILE)
+        _state_dirty = False
+    except OSError as e:
+        logger.warning("Could not save dedup state: %s", e)
 
 
 def _purge_expired():
     """Remove expired entries from the dedup cache."""
-    now = time.monotonic()
+    now = time.time()
     expired = [d for d, exp in _seen.items() if exp <= now]
     for d in expired:
         del _seen[d]
@@ -68,11 +118,16 @@ def _purge_expired():
 
 def is_new(domain: str) -> bool:
     """Return True if this domain hasn't been seen within DEDUP_TTL."""
-    now = time.monotonic()
+    global _state_dirty
+    now = time.time()
     if domain in _seen and _seen[domain] > now:
         return False
     _seen[domain] = now + DEDUP_TTL
+    _state_dirty = True
+    _save_state()
     return True
+
+
 
 
 # ── Discord embed builder ────────────────────────────────────────────────────
@@ -117,6 +172,49 @@ def _make_embeds(batch: list[dict]) -> list[dict]:
         }
         embeds.append(embed)
     return embeds
+
+
+
+
+
+# ── Liveness check ──────────────────────────────────────────────────────────
+
+def _domain_resolves(domain: str) -> bool:
+    """True if the domain has at least one A/AAAA record (DNS liveness)."""
+    try:
+        with futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(
+                socket.getaddrinfo,
+                domain, None, socket.AF_UNSPEC, socket.SOCK_STREAM,
+            )
+            fut.result(timeout=LIVENESS_TIMEOUT)
+        return True
+    except (socket.gaierror, futures.TimeoutError, OSError):
+        return False
+
+
+def _domain_answers_http(domain: str) -> bool:
+    """True if the domain serves an HTTPS response (any status = up)."""
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        urllib.request.urlopen(f"https://{domain}/", timeout=LIVENESS_TIMEOUT, context=ctx)
+        return True
+    except urllib.error.HTTPError:
+        return True  # 401/403/404… still means the service is up
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def _is_live(domain: str) -> bool:
+    """Apply the configured liveness check (dns | http | none)."""
+    if LIVENESS_CHECK == "http":
+        return _domain_answers_http(domain)
+    if LIVENESS_CHECK == "dns":
+        return _domain_resolves(domain)
+    return True
 
 
 # ── Discord sender ───────────────────────────────────────────────────────────
@@ -188,8 +286,9 @@ def _post_to_discord(embeds: list[dict]) -> bool:
 
 def main():
     logger.info("Gungnir Discord relay started")
-    logger.info("Dedup TTL: %ds | Rate limit: %.1fs | Batch size: %d",
-                DEDUP_TTL, RATE_LIMIT, BATCH_SIZE)
+    logger.info("Dedup TTL: %ds | Rate limit: %.1fs | Batch size: %d | Liveness: %s",
+                DEDUP_TTL, RATE_LIMIT, BATCH_SIZE, LIVENESS_CHECK)
+    _load_state()
 
     queue: list[dict] = []
     total_alerts = 0
@@ -206,13 +305,17 @@ def main():
             logger.debug("Skipping non-JSON line: %s", line[:80])
             continue
 
-        # Extract domains and filter for new ones
+        # Extract domains, filter for new ones, then check liveness
         domains = entry.get("domains", [])
         new_domains = []
         for d in domains:
             clean = _strip_wildcard(d)
-            if is_new(clean):
-                new_domains.append(clean)
+            if not is_new(clean):
+                continue
+            if not _is_live(clean):
+                logger.info("Dropped (no liveness): %s", clean)
+                continue
+            new_domains.append(clean)
 
         if new_domains:
             entry["_new_domains"] = new_domains
@@ -234,6 +337,7 @@ def main():
         _flush(queue, len(queue))
         total_alerts += len(queue)
 
+    _save_state()
     logger.info("Stopping — %d total alerts sent", total_alerts)
 
 
