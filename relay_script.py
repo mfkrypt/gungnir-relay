@@ -46,9 +46,6 @@ DEDUP_STATE_FILE = os.environ.get(
 LIVENESS_CHECK = os.environ.get("LIVENESS_CHECK", "dns").lower()
 LIVENESS_TIMEOUT = float(os.environ.get("LIVENESS_TIMEOUT", "3"))
 
-
-
-
 # ── Logging ──────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger("gungnir-discord")
@@ -65,9 +62,6 @@ if LOG_FILE:
     file_handler = logging.FileHandler(LOG_FILE)
     file_handler.setFormatter(fmt)
     logger.addHandler(file_handler)
-
-
-
 
 # ── Dedup cache ──────────────────────────────────────────────────────────────
 
@@ -128,8 +122,6 @@ def is_new(domain: str) -> bool:
     return True
 
 
-
-
 # ── Discord embed builder ────────────────────────────────────────────────────
 
 EMBED_COLOR = 0x00FF88  # green
@@ -172,9 +164,6 @@ def _make_embeds(batch: list[dict]) -> list[dict]:
         }
         embeds.append(embed)
     return embeds
-
-
-
 
 
 # ── Liveness check ──────────────────────────────────────────────────────────
