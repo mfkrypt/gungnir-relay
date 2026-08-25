@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Gungnir CT-monitor → Discord relay — portable setup script
 #
-# Bundle (keep all three together in one directory):
+# Bundle (keep together in one directory):
 #   setup.sh          this script
 #   discord-relay.py  the relay (single source of truth — this script copies it)
-#   domains.txt       root domains to monitor
+#   domains.txt       OPTIONAL — if present it's installed; if absent a starter
+#                     list is created in the config dir. Never auto-replaced.
 #
 # On a fresh machine it: installs the gungnir binary (via Go if needed),
-# installs the relay + domain list into ~/.config/gungnir/, writes a user
-# systemd unit that pipes them together, and starts the service.
+# installs the relay and creates the domain list in ~/.config/gungnir/, writes
+# a user systemd unit that pipes them together, and starts the service.
 #
 # Idempotent: safe to re-run. Existing files are kept, never clobbered —
 # use --force to replace them with the bundle versions (old ones get a
@@ -39,13 +40,11 @@ echo "Config dir:  $CONFIG_DIR"
 
 # ── 1. Bundle integrity ─────────────────────────────────────────────────────
 
-for f in "$RELAY" "$DOMAINS"; do
-    if [ ! -f "$f" ]; then
-        echo "ERROR: missing bundle file $f — keep setup.sh, discord-relay.py" >&2
-        echo "       and domains.txt together in one directory." >&2
-        exit 1
-    fi
-done
+if [ ! -f "$RELAY" ]; then
+    echo "ERROR: missing bundle file $RELAY — keep setup.sh and discord-relay.py" >&2
+    echo "       together in one directory." >&2
+    exit 1
+fi
 
 # ── 2. gungnir binary ───────────────────────────────────────────────────────
 
@@ -64,25 +63,44 @@ echo "Using gungnir: $GUNGNIR_BIN"
 # ── 3. Config files (keep existing unless --force) ───────────────────────────
 
 mkdir -p "$CONFIG_DIR"
-for f in "$RELAY" "$DOMAINS"; do
-    dest="$CONFIG_DIR/$(basename "$f")"
-    # Bundle already lives in the config dir (origin machine) — same inode, no-op
-    if [ -f "$dest" ] && [ "$f" -ef "$dest" ]; then
-        echo "Bundle file already in place: $dest"
-        continue
-    fi
-    if [ -f "$dest" ] && [ "$FORCE" -eq 0 ]; then
-        echo "Keeping existing $dest (use --force to replace with bundle version)"
-        continue
-    fi
+
+# Relay: copied from the bundle (single source of truth)
+dest="$CONFIG_DIR/discord-relay.py"
+if [ -f "$dest" ] && [ "$RELAY" -ef "$dest" ]; then
+    echo "Bundle file already in place: $dest"
+elif [ -f "$dest" ] && [ "$FORCE" -eq 0 ]; then
+    echo "Keeping existing $dest (use --force to replace with bundle version)"
+else
     if [ -f "$dest" ]; then
         bak="$dest.bak.$(date +%Y%m%d%H%M%S)"
         cp -a "$dest" "$bak"
         echo "Backed up existing file to $bak"
     fi
-    install -m 0644 "$f" "$dest"
+    install -m 0644 "$RELAY" "$dest"
     echo "Installed $dest"
-done
+fi
+
+# domains.txt: created if missing; replaced only when --force AND the bundle
+# carries a real copy — a generated starter never clobbers an existing list
+dest="$CONFIG_DIR/domains.txt"
+if [ -f "$dest" ]; then
+    if [ "$FORCE" -eq 1 ] && [ -f "$DOMAINS" ] && [ ! "$DOMAINS" -ef "$dest" ]; then
+        bak="$dest.bak.$(date +%Y%m%d%H%M%S)"
+        cp -a "$dest" "$bak"
+        install -m 0644 "$DOMAINS" "$dest"
+        echo "Replaced $dest from bundle (backup: $bak)"
+    else
+        echo "Keeping existing $dest"
+    fi
+elif [ -f "$DOMAINS" ]; then
+    install -m 0644 "$DOMAINS" "$dest"
+    echo "Installed domains.txt from bundle"
+else
+    cat > "$dest" <<'TEMPLATE'
+test.com
+TEMPLATE
+    echo "Created starter domains.txt in $CONFIG_DIR — edit it to add your targets."
+fi
 
 # ── 4. Systemd user unit ────────────────────────────────────────────────────
 
