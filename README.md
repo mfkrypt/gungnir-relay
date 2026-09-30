@@ -38,14 +38,6 @@ Credits to @g0ldencybersec
 └──────────────┘
 ```
 
-## ⚠️ This repository is public
-
-**Never commit a webhook URL or a target list.** setup.sh collects webhooks at
-install time and writes them to `~/.config/*/env` with mode `0600` — they never
-need to touch this repo. `.gitignore` blocks the obvious mistake, but the surest
-protection is not doing it: anyone holding a webhook URL can post to your channel,
-and a published target list leaks your scope.
-
 ## Layout
 
 ```
