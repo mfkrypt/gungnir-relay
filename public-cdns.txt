@@ -1,0 +1,33 @@
+# Hosts whose sourcemaps are public-by-design — tracked in state but never alerted.
+#
+# A .map on cdn.jsdelivr.net/unpkg/cdnjs is not a leak: every npm package ships
+# one and the CDN serves it to the world. Alerting on those buries the signal
+# that actually matters — *your* code leaking source. Suffix-matched, so an
+# entry of example.com also covers cdn.example.com.
+#
+# Deliberately NOT listed here: site-builder CDNs that host the target's OWN
+# build (cdn.prod.website-files.com for Webflow, *.cloudfront.net asset roots).
+# Those are the target's code and a .map there IS a finding.
+
+# ── package CDNs ────────────────────────────────────────────────────────────
+cdn.jsdelivr.net
+unpkg.com
+cdnjs.cloudflare.com
+ajax.googleapis.com
+code.jquery.com
+stackpath.bootstrapcdn.com
+maxcdn.bootstrapcdn.com
+cdn.datatables.net
+cdn.tailwindcss.com
+esm.sh
+skypack.dev
+
+# ── analytics / tag managers / consent (public by design, not first-party) ──
+www.googletagmanager.com
+www.google-analytics.com
+analytics.ahrefs.com
+cmp.osano.com
+connect.facebook.net
+static.hotjar.com
+script.hotjar.com
+js.stripe.com

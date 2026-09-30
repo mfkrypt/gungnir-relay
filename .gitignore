@@ -1,0 +1,14 @@
+# This repository is PUBLIC. Nothing here may hold a secret or a target list.
+
+# Webhook URLs — the relay reads DISCORD_WEBHOOK_URL, js-watch reads an env file.
+env
+.env
+*.env
+
+# Target lists. Bug-bounty scopes are not published; setup.sh generates a
+# starter locally when these are absent from the bundle.
+domains.txt
+hosts.txt
+
+# Backups written by setup.sh --force
+*.bak.*

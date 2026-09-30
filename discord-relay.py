@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 
 WEBHOOK_URL = os.environ.get(
     "DISCORD_WEBHOOK_URL",
-    "<PASTE_HERE>",
+    "",
 )
 
 DEDUP_TTL = int(os.environ.get("DEDUP_TTL_SECONDS", "86400"))
