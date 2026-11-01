@@ -124,32 +124,3 @@ webhook is reused rather than re-prompted.
 | `new-sourcemap` | a `.map` is now retrievable | **reportable** — source leak, `hunt-source-leak` territory |
 | `chunk-gone` | a known chunk vanished | removed route/feature |
 
-
-Which 25 get fetched is **ranked, not alphabetical**: bundles whose filename is new
-come first (a deploy today would otherwise lose its slot to a chunk unchanged for
-months), then bundles already known to expose a `.map`, then first-party-looking
-paths, then everything else. The new-filename tier costs nothing — that diff is
-already computed for the `new-chunk` alert — and it is empty on a steady-state host,
-so the order is unchanged when nothing has shipped.
-
-A sweep is capped at 25 bundles per host plus one range-GET `.map` probe each —
-roughly 300 requests across six hosts, about 85 seconds. Raise the cap with
-`MAX_FETCH=50 ~/.local/bin/js-watch.sh` for a target you're actively working.
-
-Run it by hand any time:
-
-```bash
-~/.local/bin/js-watch.sh --host https://app.example.com   # one host, verbose to stderr
-~/.local/bin/js-watch.sh                                  # all hosts, silent unless changed
-~/.local/bin/js-watch.sh --no-secrets                      # skip the credential sweep
-MAX_SECRET_HITS=50 ~/.local/bin/js-watch.sh                # name more hits per alert
-SHOW_SECRETS=1 ~/.local/bin/js-watch.sh                    # full values in the alert
-systemctl --user start js-watch.service                   # what the timer runs
-journalctl --user -u js-watch.service -n 40               # last run's output
-```
-
-To reset a baseline, delete its state dir — the next run re-seeds silently:
-
-```bash
-rm -rf ~/.local/state/js-watch/app.example.com
-```

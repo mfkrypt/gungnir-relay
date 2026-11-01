@@ -43,6 +43,10 @@ DEDUP_STATE_FILE = os.environ.get(
     "DEDUP_STATE_FILE",
     os.path.expanduser("~/.config/gungnir/dedup_state.json"),
 )
+DEAD_LETTER_FILE = os.environ.get(
+    "DEAD_LETTER_FILE",
+    os.path.expanduser("~/.config/gungnir/failed_alerts.jsonl"),
+)
 LIVENESS_CHECK = os.environ.get("LIVENESS_CHECK", "dns").lower()
 LIVENESS_TIMEOUT = float(os.environ.get("LIVENESS_TIMEOUT", "3"))
 
@@ -65,7 +69,8 @@ if LOG_FILE:
 
 # ── Dedup cache ──────────────────────────────────────────────────────────────
 
-_seen: dict[str, float] = {}  # domain → wall-clock expiry timestamp
+_seen: dict[str, float] = {}  # domain → wall-clock expiry timestamp (DELIVERED)
+_pending: set[str] = set()  # queued but not yet accepted by Discord
 _state_dirty = False
 
 
@@ -111,15 +116,55 @@ def _purge_expired():
 
 
 def is_new(domain: str) -> bool:
-    """Return True if this domain hasn't been seen within DEDUP_TTL."""
-    global _state_dirty
+    """Return True if this domain is neither delivered nor already queued.
+
+    Does NOT mutate `_seen`. A domain is written to the dedup state only once
+    Discord has ACCEPTED it (see `_commit`). The old code marked it here, which
+    is what turned a rejected post into permanent loss: the 400 path dropped
+    the message while the domain was already recorded as alerted, so it could
+    never be retried and would not be re-alerted when the cert reappeared.
+    """
     now = time.time()
     if domain in _seen and _seen[domain] > now:
         return False
-    _seen[domain] = now + DEDUP_TTL
-    _state_dirty = True
-    _save_state()
-    return True
+    return domain not in _pending
+
+
+def _claim(domains) -> None:
+    """Mark domains as queued so a second cert can't double-queue them."""
+    _pending.update(domains)
+
+
+def _commit(domains) -> None:
+    """Record delivery. Only call once Discord has accepted the message."""
+    global _state_dirty
+    now = time.time()
+    for d in domains:
+        _seen[d] = now + DEDUP_TTL
+        _pending.discard(d)
+    if domains:
+        _state_dirty = True
+        _save_state()
+
+
+def _release(domains) -> None:
+    """Un-queue domains whose delivery failed, so a later cert can re-alert."""
+    for d in domains:
+        _pending.discard(d)
+
+
+def _dead_letter(batch: list[dict], domains: list[str]) -> None:
+    """Append an undeliverable batch to disk so it can be replayed later."""
+    try:
+        with open(DEAD_LETTER_FILE, "a") as f:
+            f.write(json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "domains": domains,
+                "entries": batch,
+            }, default=str) + "\n")
+        logger.info("Wrote %d undeliverable domain(s) to %s", len(domains), DEAD_LETTER_FILE)
+    except OSError as e:
+        logger.error("Could not write dead-letter file: %s", e)
 
 
 # ── Discord embed builder ────────────────────────────────────────────────────
@@ -134,32 +179,69 @@ def _strip_wildcard(domain: str) -> str:
     return domain
 
 
+def _as_text(value, fallback: str = "—") -> str:
+    """Coerce a gungnir JSON field into a Discord-safe string.
+
+    Root cause of the recurring `HTTP 400 {"embeds": ["<index>"]}` drops:
+    gungnir's certificate struct declares `Organization []string`, so `org`
+    arrives as a LIST. Writing it straight into an embed field produced
+    {"value": ["Acme"]}; Discord requires a string and rejects the whole
+    message. Verified: array → 400, joined string → 200.
+    """
+    if value is None:
+        return fallback
+    if isinstance(value, (list, tuple, set)):
+        joined = ", ".join(str(v) for v in value if v not in (None, ""))
+        return joined or fallback
+    if isinstance(value, bool):
+        return str(value)
+    text = str(value).strip()
+    return text or fallback
+
+
+def _clamp(text: str, limit: int) -> str:
+    """Hard-truncate to a Discord content limit (title 256, field value 1024)."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+# Discord embed limits
+_TITLE_MAX = 256
+_FIELD_NAME_MAX = 256
+_FIELD_VALUE_MAX = 1024
+_MAX_EMBEDS = 10
+
+
 def _make_embeds(batch: list[dict]) -> list[dict]:
     """Build one or more Discord embed objects from a batch of cert entries."""
     embeds = []
-    for entry in batch:
-        cn = entry.get("commonName", "unknown")
-        org = entry.get("org") or "—"
-        sans = entry.get("san", [])
-        source = entry.get("source", "unknown")
+    for entry in batch[:_MAX_EMBEDS]:
+        cn = _as_text(entry.get("commonName"), "unknown")
+        org = _as_text(entry.get("org"))
+        sans = entry.get("san") or []
+        if not isinstance(sans, list):
+            sans = [sans]
+        source = _as_text(entry.get("source"), "unknown")
 
         # Primary domain: first non-wildcard SAN, or fall back to CN
-        cleaned = [_strip_wildcard(d) for d in sans]
+        cleaned = [_strip_wildcard(_as_text(d, "")) for d in sans]
+        cleaned = [d for d in cleaned if d]
         primary = cleaned[0] if cleaned else _strip_wildcard(cn)
         san_list = ", ".join(cleaned[:8])
         if len(cleaned) > 8:
             san_list += f" … (+{len(cleaned) - 8} more)"
 
         embed = {
-            "title": f"🔔 {primary}",
+            "title": _clamp(f"🔔 {primary}", _TITLE_MAX),
             "color": EMBED_COLOR,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "fields": [
-                {"name": "Common Name", "value": cn, "inline": True},
-                {"name": "Source", "value": source, "inline": True},
+                {"name": "Common Name", "value": _clamp(cn, _FIELD_VALUE_MAX), "inline": True},
+                {"name": "Source", "value": _clamp(source, _FIELD_VALUE_MAX), "inline": True},
                 {"name": "SAN Count", "value": str(len(sans)), "inline": True},
-                {"name": "Organization", "value": org, "inline": True},
-                {"name": "SANs", "value": f"`{san_list}`", "inline": False},
+                {"name": "Organization", "value": _clamp(org, _FIELD_VALUE_MAX), "inline": True},
+                {"name": "SANs", "value": _clamp(f"`{san_list}`", _FIELD_VALUE_MAX), "inline": False},
             ],
         }
         embeds.append(embed)
@@ -245,7 +327,9 @@ def _post_to_discord(embeds: list[dict]) -> bool:
                 # Treat non-204 as transient
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")
-            logger.warning("HTTP %d from Discord (attempt %d/3): %s", e.code, attempt, body[:200])
+            # Log the full body — Discord keys validation errors by embed index,
+            # and the 200-char truncation hid which field was actually invalid.
+            logger.warning("HTTP %d from Discord (attempt %d/3): %s", e.code, attempt, body[:1000])
             if e.code == 429:
                 # Respect Retry-After header
                 retry_after = e.headers.get("Retry-After", "5")
@@ -303,10 +387,14 @@ def main():
                 continue
             if not _is_live(clean):
                 logger.info("Dropped (no liveness): %s", clean)
+                # Nothing to deliver, so there is no alert to lose — record it
+                # now rather than probing the same dead name on every cert.
+                _commit([clean])
                 continue
             new_domains.append(clean)
 
         if new_domains:
+            _claim(new_domains)
             entry["_new_domains"] = new_domains
             queue.append(entry)
             logger.debug("Queued: %s", new_domains)
@@ -347,8 +435,13 @@ def _flush(queue: list[dict], count: int):
 
     domains_alerted = [d for e in batch for d in e.get("_new_domains", [])]
     if ok:
+        _commit(domains_alerted)
         logger.info("Posted %d domain(s): %s", len(domains_alerted), ", ".join(domains_alerted))
     else:
+        # Do NOT mark these as seen: release them from the pending set and
+        # persist the batch so the alert is recoverable instead of lost.
+        _release(domains_alerted)
+        _dead_letter(batch, domains_alerted)
         logger.warning("Failed to post %d domain(s): %s", len(domains_alerted), ", ".join(domains_alerted))
 
 
